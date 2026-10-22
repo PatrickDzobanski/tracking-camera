@@ -3,6 +3,7 @@ import numpy as np
 import time
 import sys
 import csv
+import threading
 from pathlib import Path
 
 try:
@@ -10,8 +11,86 @@ try:
 except ImportError:
     serial = None
 
+
+class LatestFrameCapture:
+    def __init__(self, video):
+        self.video = video
+        self.lock = threading.Lock()
+        self.frame_available = threading.Event()
+        self.stop_event = threading.Event()
+        self.finished_event = threading.Event()
+        self.latest_frame = None
+        self.latest_timestamp = None
+        self.latest_sequence = 0
+        self.consumed_sequence = 0
+        self.captured_frames = 0
+        self.dropped_frames = 0
+        self.capture_error = None
+        self.capture_failed = False
+        self.thread = threading.Thread(
+            target=self._capture_loop,
+            name="camera-capture",
+            daemon=True,
+        )
+
+    def _capture_loop(self):
+        try:
+            while not self.stop_event.is_set():
+                success, frame = self.video.read()
+                captured_at = time.perf_counter()
+
+                if not success:
+                    with self.lock:
+                        self.capture_failed = True
+                    return
+
+                with self.lock:
+                    if self.latest_sequence > self.consumed_sequence:
+                        self.dropped_frames += 1
+                    self.latest_frame = frame
+                    self.latest_timestamp = captured_at
+                    self.latest_sequence += 1
+                    self.captured_frames += 1
+                    self.frame_available.set()
+        except cv2.error as exc:
+            with self.lock:
+                self.capture_error = str(exc)
+        finally:
+            self.finished_event.set()
+            self.frame_available.set()
+
+    def start(self):
+        self.thread.start()
+
+    def get_latest(self):
+        with self.lock:
+            if (
+                self.latest_frame is None
+                or self.latest_sequence <= self.consumed_sequence
+            ):
+                self.frame_available.clear()
+                return None
+
+            latest = (
+                self.latest_frame,
+                self.latest_timestamp,
+                self.latest_sequence,
+            )
+            self.consumed_sequence = self.latest_sequence
+            self.frame_available.clear()
+            return latest
+
+    def get_statistics(self):
+        with self.lock:
+            return self.captured_frames, self.dropped_frames
+
+    def stop(self):
+        self.stop_event.set()
+        self.frame_available.set()
+
+
 # 1. CONFIGURATION
-CAMERA = 0
+CAMERA = 1
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 REFERENCE_IMAGE_PATH =  "img.jpg"
@@ -19,8 +98,11 @@ REFERENCE_IMAGE_PATH =  "img.jpg"
 ENABLE_COMPLEMENTARY_ZOOM = True
 ZOOM_FACTORS = (3, 4)
 ZOOM_MARGIN = 30
-ENABLE_ZOOM_BENCHMARK = True
-SAVE_ZOOM_CSV = True
+# Set to True to re-enable benchmark execution and its CSV columns.
+ENABLE_ZOOM_BENCHMARK = False
+SAVE_ZOOM_CSV = False
+# Set to True to re-enable adaptive HSV instead of the fixed hsv.csv limits.
+USE_ADAPTIVE_HSV = False
 # Minimum contour area in original-image pixels squared for zoom searches.
 ZOOM_MIN_AREA_PX2 = 50
 
@@ -85,7 +167,8 @@ H_MAX = int(hsv_values["hmax"])
 S_MIN = int(hsv_values["smin"])
 S_MAX = int(hsv_values["smax"])
 
-REFERENCE_V_MIN = int(hsv_values["vmin"])
+V_MIN = int(hsv_values["vmin"])
+REFERENCE_V_MIN = V_MIN
 V_MAX = int(hsv_values["vmax"])
 
 INITIAL_V_MIN = 100
@@ -179,6 +262,7 @@ HSV_MASK_WINDOW = 'Adaptive HSV mask'
 EXIT_KEY = 'q'
 NORMALIZED_CANDIDATE_WINDOW = 'Normalized candidate'
 KEY_WAIT_MS = 1
+CAPTURE_DIAGNOSTICS_INTERVAL_SECONDS = 1.0
 
 # --- EDGES AND CONTOURS ---
 LOW_CANNY_FACTOR = 0.66
@@ -201,11 +285,9 @@ CURRENT_V_CENTER_WEIGHT = 0.8
 AMBIENT_V_CENTER_WEIGHT = 0.2
 
 # --- HSV MASK ---
-HSV_KERNEL_SIZE = (5, 5)
-MASK_OPEN_OPERATION = cv2.MORPH_OPEN
-HSV_OPEN_ITERATIONS = 1
-MASK_CLOSE_OPERATION = cv2.MORPH_CLOSE
-HSV_CLOSE_ITERATIONS = 1
+# CLOSE fills gaps before OPEN removes small noise, matching jokerTESTE.PY.
+HSV_CLOSE_KERNEL_SIZE = (7, 7)
+HSV_OPEN_KERNEL_SIZE = (3, 3)
 
 CONTOUR_BLUR_SIZE = (5, 5)
 CONTOUR_BLUR_SIGMA = 0
@@ -262,16 +344,13 @@ TEXT_POSITION_245 = (20, 245)
 TEXT_POSITION_305 = (20, 305)
 TEXT_POSITION_275 = (20, 275)
 
-KERNEL_HSV = np.ones(
-    HSV_KERNEL_SIZE,
-    np.uint8,
-)
+KERNEL_HSV_CLOSE = np.ones(HSV_CLOSE_KERNEL_SIZE, np.uint8)
+KERNEL_HSV_OPEN = np.ones(HSV_OPEN_KERNEL_SIZE, np.uint8)
 
 # 2. UART COMMUNICATION
 
-SERIAL_PORT = "COM4"
+SERIAL_PORT = "COM6"
 SERIAL_BAUDRATE = 115200
-REQUIRE_STM32 = False
 
 
 class UARTSerialController:
@@ -315,6 +394,11 @@ class UARTSerialController:
             return True
         except (serial.SerialException, OSError) as exc:
             print(f"[UART] Could not open {self.port}: {exc}")
+            try:
+                if self.serial_port is not None and self.serial_port.is_open:
+                    self.serial_port.close()
+            except (serial.SerialException, OSError, ValueError) as close_exc:
+                print(f"[UART] Could not close {self.port}: {close_exc}")
             self.serial_port = None
             return False
 
@@ -331,8 +415,8 @@ class UARTSerialController:
             try:
                 if self.serial_port is not None and self.serial_port.is_open:
                     self.serial_port.close()
-            except Exception:
-                pass
+            except (serial.SerialException, OSError, ValueError) as close_exc:
+                print(f"[UART] Could not close {self.port}: {close_exc}")
             self.serial_port = None
             return False
 
@@ -348,8 +432,8 @@ class UARTSerialController:
             try:
                 if self.serial_port.is_open:
                     self.serial_port.close()
-            except Exception:
-                pass
+            except (serial.SerialException, OSError, ValueError) as exc:
+                print(f"[UART] Could not close {self.port}: {exc}")
             finally:
                 self.serial_port = None
 
@@ -768,48 +852,24 @@ class PredictiveKalmanTracker:
 
 # 3. HSV SEGMENTATION
 
-def create_hsv_mask(hsv, vmin):
+def create_hsv_mask(hsv, vmin, zoom_factor=1):
+    low = np.array([H_MIN, S_MIN, int(vmin)], dtype=np.uint8)
+    high = np.array([H_MAX, S_MAX, V_MAX], dtype=np.uint8)
+    mask = cv2.inRange(hsv, low, high)
 
-    vmin = int(
-        np.clip(
-            vmin,
-            V_MIN_LOWER_LIMIT,
-            V_MIN_UPPER_LIMIT,
+    if zoom_factor == 1:
+        kernel_close = KERNEL_HSV_CLOSE
+        kernel_open = KERNEL_HSV_OPEN
+    else:
+        kernel_close = np.ones(
+            scale_odd_kernel(HSV_CLOSE_KERNEL_SIZE, zoom_factor), np.uint8
         )
-    )
+        kernel_open = np.ones(
+            scale_odd_kernel(HSV_OPEN_KERNEL_SIZE, zoom_factor), np.uint8
+        )
 
-    hsv_min = np.array([
-        H_MIN,
-        S_MIN,
-        vmin,
-    ], dtype=np.uint8)
-
-    hsv_max = np.array([
-        H_MAX,
-        S_MAX,
-        V_MAX,
-    ], dtype=np.uint8)
-
-    mask = cv2.inRange(
-        hsv,
-        hsv_min,
-        hsv_max,
-    )
-
-    mask = cv2.morphologyEx(
-        mask,
-        MASK_OPEN_OPERATION,
-        KERNEL_HSV,
-        iterations=HSV_OPEN_ITERATIONS,
-    )
-
-    mask = cv2.morphologyEx(
-        mask,
-        MASK_CLOSE_OPERATION,
-        KERNEL_HSV,
-        iterations=HSV_CLOSE_ITERATIONS,
-    )
-
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
     return mask
 
 def create_mask(image, vmin=REFERENCE_V_MIN):
@@ -2080,32 +2140,7 @@ def scale_odd_kernel(kernel_size, scale):
     )
 
 def create_zoom_hsv_mask(hsv, vmin, zoom_factor):
-    vmin = int(
-        np.clip(
-            vmin,
-            V_MIN_LOWER_LIMIT,
-            V_MIN_UPPER_LIMIT,
-        )
-    )
-    hsv_min = np.array([H_MIN, S_MIN, vmin], dtype=np.uint8)
-    hsv_max = np.array([H_MAX, S_MAX, V_MAX], dtype=np.uint8)
-    mask = cv2.inRange(hsv, hsv_min, hsv_max)
-    zoom_kernel = np.ones(
-        scale_odd_kernel(HSV_KERNEL_SIZE, zoom_factor),
-        np.uint8,
-    )
-    mask = cv2.morphologyEx(
-        mask,
-        MASK_OPEN_OPERATION,
-        zoom_kernel,
-        iterations=HSV_OPEN_ITERATIONS,
-    )
-    return cv2.morphologyEx(
-        mask,
-        MASK_CLOSE_OPERATION,
-        zoom_kernel,
-        iterations=HSV_CLOSE_ITERATIONS,
-    )
+    return create_hsv_mask(hsv, vmin, zoom_factor=zoom_factor)
 
 def expand_zoom_roi(bounds, image_shape, margin):
     x1, y1, x2, y2 = bounds
@@ -2627,28 +2662,13 @@ tracker = PredictiveKalmanTracker(
 v_controller = AdaptiveVController()
 ############################################
 uart_controller = UARTSerialController()
-
-if serial is None:
-    if REQUIRE_STM32:
-        raise RuntimeError(
-            "PySerial nao esta instalado neste Python!"
-        )
-    print("[UART] PySerial nao instalado; executando sem STM32.")
-
-stm32_connected = uart_controller.open()
-if stm32_connected:
-    print("[UART] STM32 CONECTADA!")
-    print(f"[UART] Porta: {uart_controller.port}")
-    print(f"[UART] Baudrate: {uart_controller.baudrate}")
-elif REQUIRE_STM32:
-    raise RuntimeError(
-        "Nao foi possivel abrir a porta serial da STM32."
-    )
-else:
-    print("[UART] STM32 desconectada; executando sem comunicacao UART.")
 ############################################################
-previous_time = time.perf_counter()
+previous_time = None
 frame_number = 0
+processed_frame_count = 0
+capture_worker = LatestFrameCapture(video)
+capture_started = False
+camera_released = False
 zoom_csv_file = None
 zoom_csv_writer = None
 zoom_csv_path = None
@@ -2676,6 +2696,46 @@ zoom_summary = {
 # 8. MAIN LOOP
 
 try:
+    use_arduino = input(
+        "Deseja utilizar a comunicação serial com o Arduino? [s/N]: "
+    ).strip().lower() in ("s", "sim", "y", "yes")
+
+    if use_arduino:
+        if serial is None:
+            raise RuntimeError(
+                "PySerial nao esta instalado neste Python."
+            )
+
+        if not uart_controller.open():
+            raise RuntimeError(
+                f"Nao foi possivel conectar ao Arduino em "
+                f"{uart_controller.port}. Verifique a conexao."
+            )
+
+        print("[UART] Arduino conectado.")
+        print(f"[UART] Porta: {uart_controller.port}")
+        print(f"[UART] Baudrate: {uart_controller.baudrate}")
+
+        time.sleep(2.5)
+
+        confirmation = input(
+            "[Arduino] Plataforma alinhada? Definir zero logico? [s/N]: "
+        ).strip().lower()
+
+        if confirmation not in ("s", "sim", "y", "yes"):
+            raise RuntimeError(
+                "Inicializacao cancelada: zero nao autorizado."
+            )
+
+        if not uart_controller.send("Z"):
+            raise RuntimeError(
+                "Falha ao enviar Z para o Arduino."
+            )
+
+        print("[Arduino] Comando Z enviado.")
+    else:
+        print("[UART] Comunicacao serial desativada.")
+
     if SAVE_ZOOM_CSV:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         csv_directory = Path(__file__).resolve().parent
@@ -2696,27 +2756,35 @@ try:
                 suffix += 1
             else:
                 zoom_csv_path = candidate_path
-        zoom_csv_writer = csv.DictWriter(
-            zoom_csv_file,
-            fieldnames=(
-                "frame",
-                "timestamp",
-                "original_result",
-                "original_score",
-                "original_template_score",
-                "original_processing_ms",
-                "zoom_3x_result",
-                "zoom_3x_score",
-                "zoom_3x_processing_ms",
-                "zoom_4x_result",
-                "zoom_4x_score",
-                "zoom_4x_processing_ms",
-                "chosen_method",
-                "consecutive_missed_frames",
-                "object_area_px2",
-                "tracking_state",
-                "operational_total_ms",
-                "operational_fps",
+        zoom_csv_fieldnames = [
+            "frame",
+            "timestamp",
+            "original_result",
+            "original_score",
+            "original_template_score",
+            "original_processing_ms",
+            "zoom_3x_result",
+            "zoom_3x_score",
+            "zoom_3x_processing_ms",
+            "zoom_4x_result",
+            "zoom_4x_score",
+            "zoom_4x_processing_ms",
+            "chosen_method",
+            "consecutive_missed_frames",
+            "object_area_px2",
+            "tracking_state",
+            "operational_total_ms",
+            "operational_fps",
+            "frame_processing_ms",
+            "frame_processing_fps",
+            "real_loop_ms",
+            "real_loop_fps",
+            "false_positive_confirmed",
+            "kalman_rejected_zoom_candidate",
+            "zoom_roi_source",
+        ]
+        if ENABLE_ZOOM_BENCHMARK:
+            zoom_csv_fieldnames[18:18] = [
                 "benchmark_3x_result",
                 "benchmark_3x_score",
                 "benchmark_3x_processing_ms",
@@ -2726,32 +2794,60 @@ try:
                 "benchmark_extra_ms",
                 "benchmark_total_ms",
                 "benchmark_fps",
-                "frame_processing_ms",
-                "frame_processing_fps",
-                "real_loop_ms",
-                "real_loop_fps",
+            ]
+            zoom_csv_fieldnames[31:31] = [
                 "benchmark_comparison",
                 "method_disagreement",
-                "false_positive_confirmed",
-                "kalman_rejected_zoom_candidate",
-                "zoom_roi_source",
-            ),
+            ]
+        zoom_csv_writer = csv.DictWriter(
+            zoom_csv_file,
+            fieldnames=zoom_csv_fieldnames,
         )
         zoom_csv_writer.writeheader()
         print(f"[ZOOM TEST] CSV: {zoom_csv_path}")
 
+    capture_worker.start()
+    capture_started = True
+    diagnostics_started = time.perf_counter()
+    last_diagnostics_time = diagnostics_started
+    last_capture_count, _ = capture_worker.get_statistics()
+    last_processed_count = processed_frame_count
+    frame_latency_ms = 0.0
+
     while True:
-
         loop_started = time.perf_counter()
-        success, frame = video.read()
 
-        if not success:
-            print(
-                "[ERROR] Failed to capture frame."
-            )
-            break
+        if not capture_worker.frame_available.wait(timeout=0.5):
+            if capture_worker.finished_event.is_set():
+                if capture_worker.capture_error is not None:
+                    print(
+                        "[ERROR] Camera capture failed: "
+                        f"{capture_worker.capture_error}"
+                    )
+                elif capture_worker.capture_failed:
+                    print("[ERROR] Failed to capture frame.")
+                break
+            continue
 
+        latest_frame = capture_worker.get_latest()
+        if latest_frame is None:
+            if capture_worker.finished_event.is_set():
+                if capture_worker.capture_error is not None:
+                    print(
+                        "[ERROR] Camera capture failed: "
+                        f"{capture_worker.capture_error}"
+                    )
+                elif capture_worker.capture_failed:
+                    print("[ERROR] Failed to capture frame.")
+                break
+            continue
+
+        frame, frame_capture_time, _ = latest_frame
         frame_processing_started = time.perf_counter()
+        frame_latency_ms = max(
+            0.0,
+            (frame_processing_started - frame_capture_time) * 1000.0,
+        )
         frame_timestamp = (
             time.strftime("%Y-%m-%dT%H:%M:%S")
             + f".{int((time.time() % 1) * 1000):03d}"
@@ -2761,9 +2857,11 @@ try:
 
         video_height, video_width = frame.shape[:2]
 
-        current_time = time.perf_counter()
-        delta_time = current_time - previous_time
-        previous_time = current_time
+        if previous_time is None:
+            delta_time = MIN_DT
+        else:
+            delta_time = max(0.0, frame_capture_time - previous_time)
+        previous_time = frame_capture_time
 
         prediction = tracker.predict(delta_time)
 
@@ -2777,19 +2875,25 @@ try:
             cv2.COLOR_BGR2HSV,
         )
 
-        v_info = v_controller.update(
-            image=frame,
-            hsv=hsv_frame,
-            frame_number=frame_number,
-            prediction=prediction,
-            processed_reference=processed_reference,
-            reference_aspect_ratio=REFERENCE_ASPECT_RATIO,
-            normalized_width=NORMALIZED_WIDTH,
-            normalized_height=NORMALIZED_HEIGHT,
-        )
-
-        mask = v_info["mask"]
-        current_v_min = v_info["vmin"]
+        if USE_ADAPTIVE_HSV:
+            v_info = v_controller.update(
+                image=frame,
+                hsv=hsv_frame,
+                frame_number=frame_number,
+                prediction=prediction,
+                processed_reference=processed_reference,
+                reference_aspect_ratio=REFERENCE_ASPECT_RATIO,
+                normalized_width=NORMALIZED_WIDTH,
+                normalized_height=NORMALIZED_HEIGHT,
+            )
+            mask = v_info["mask"]
+            current_v_min = v_info["vmin"]
+        else:
+            current_v_min = V_MIN
+            mask = create_hsv_mask(
+                hsv_frame,
+                current_v_min,
+            )
 
         search_mask = mask
         tracking_roi = None
@@ -3315,11 +3419,12 @@ try:
                 movement_x = "SEARCHING"
                 movement_y = "SEARCHING"
 
-            uart_controller.send_tracking_state(
-                tracking_active=tracking_active,
-                error_x=error_x,
-                error_y=error_y,
-            )
+            if uart_controller.is_connected:
+                uart_controller.send_tracking_state(
+                    tracking_active=tracking_active,
+                    error_x=error_x,
+                    error_y=error_y,
+                )
             print(
                 f"[TRACKING] state="
                 f"{'TRACKING' if tracking_active else 'SEARCHING'} "
@@ -3631,11 +3736,12 @@ try:
                     TEXT_THICKNESS_2,
                 )
 
-            uart_controller.send_tracking_state(
-                tracking_active=tracking_active,
-                error_x=error_x,
-                error_y=error_y,
-            )
+            if uart_controller.is_connected:
+                uart_controller.send_tracking_state(
+                    tracking_active=tracking_active,
+                    error_x=error_x,
+                    error_y=error_y,
+                )
             print(
                 f"[TRACKING] state="
                 f"{'TRACKING' if tracking_active else 'SEARCHING'} "
@@ -3815,12 +3921,6 @@ try:
                     1.0 / operational_total_seconds
                     if operational_total_seconds > 0 else 0.0
                 ),
-                "benchmark_extra_ms": benchmark_extra_seconds * 1000.0,
-                "benchmark_total_ms": benchmark_total_seconds * 1000.0,
-                "benchmark_fps": (
-                    1.0 / benchmark_total_seconds
-                    if benchmark_total_seconds > 0 else 0.0
-                ),
                 "frame_processing_ms": (
                     frame_processing_seconds * 1000.0
                 ),
@@ -3830,8 +3930,6 @@ try:
                 ),
                 "real_loop_ms": "",
                 "real_loop_fps": "",
-                "benchmark_comparison": benchmark_comparison,
-                "method_disagreement": method_disagreement,
                 "false_positive_confirmed": false_positive_confirmed,
                 "kalman_rejected_zoom_candidate": (
                     "YES" if kalman_rejected_zoom_candidate
@@ -3840,6 +3938,21 @@ try:
                 ),
                 "zoom_roi_source": zoom_roi_source,
             }
+            if ENABLE_ZOOM_BENCHMARK:
+                row.update({
+                    "benchmark_extra_ms": (
+                        benchmark_extra_seconds * 1000.0
+                    ),
+                    "benchmark_total_ms": (
+                        benchmark_total_seconds * 1000.0
+                    ),
+                    "benchmark_fps": (
+                        1.0 / benchmark_total_seconds
+                        if benchmark_total_seconds > 0 else 0.0
+                    ),
+                    "benchmark_comparison": benchmark_comparison,
+                    "method_disagreement": method_disagreement,
+                })
             for factor in ZOOM_FACTORS:
                 operation_seconds = operational_zoom_seconds[factor]
                 operation_candidate = operational_zoom_results[factor]
@@ -3861,22 +3974,23 @@ try:
                     operation_seconds * 1000.0
                     if operation_seconds is not None else "NOT_EXECUTED"
                 )
-                benchmark_prefix = f"benchmark_{factor}x"
-                row[f"{benchmark_prefix}_result"] = (
-                    "NOT_EXECUTED"
-                    if benchmark_seconds is None
-                    else "DETECTED"
-                    if benchmark_candidate is not None
-                    else "NOT_DETECTED"
-                )
-                row[f"{benchmark_prefix}_score"] = (
-                    benchmark_candidate["robustness_score"]
-                    if benchmark_candidate is not None else ""
-                )
-                row[f"{benchmark_prefix}_processing_ms"] = (
-                    benchmark_seconds * 1000.0
-                    if benchmark_seconds is not None else "NOT_EXECUTED"
-                )
+                if ENABLE_ZOOM_BENCHMARK:
+                    benchmark_prefix = f"benchmark_{factor}x"
+                    row[f"{benchmark_prefix}_result"] = (
+                        "NOT_EXECUTED"
+                        if benchmark_seconds is None
+                        else "DETECTED"
+                        if benchmark_candidate is not None
+                        else "NOT_DETECTED"
+                    )
+                    row[f"{benchmark_prefix}_score"] = (
+                        benchmark_candidate["robustness_score"]
+                        if benchmark_candidate is not None else ""
+                    )
+                    row[f"{benchmark_prefix}_processing_ms"] = (
+                        benchmark_seconds * 1000.0
+                        if benchmark_seconds is not None else "NOT_EXECUTED"
+                    )
             zoom_csv_row = row
 
         v_info_x = max(MIN_DEBUG_X_MARGIN, video_width - DEBUG_PANEL_WIDTH)
@@ -3890,36 +4004,14 @@ try:
 
         v_lines = [
             f"STATE: {system_state}",
-            f"ADAPTIVE HSV | {v_info['mode']}",
-            f"V brightness: {v_info['current_brightness']:.1f}  filtered: {v_info['filtered_brightness']:.1f}",
-            f"Ambient V base: {v_info['v_base']}  Selected Vmin: {current_v_min}",
-            f"Adjustment area: {v_info['area']:.0f} px2",
-            f"Visual: {v_info['visual_score']:.2f}  Shape: {v_info['shape_score']:.2f}",
-            f"AreaScore: {v_info['area_score']:.2f}  J: {v_info['adjustment_score']:.2f}",
+            (
+                f"HSV ADAPTIVE | {v_info['mode']}"
+                if USE_ADAPTIVE_HSV
+                else "HSV FIXED | hsv.csv"
+            ),
+            f"H: {H_MIN}-{H_MAX}  S: {S_MIN}-{S_MAX}",
+            f"V: {current_v_min}-{V_MAX}",
         ]
-
-        if v_info["roi"] is None:
-            v_lines.append("V adjustment: FULL FRAME")
-        else:
-            v_lines.append("V adjustment: KALMAN ROI")
-
-            x1v, y1v, x2v, y2v = v_info["roi"]
-            cv2.rectangle(
-                display_image,
-                (x1v, y1v),
-                (x2v, y2v),
-                V_ADJUSTMENT_ROI_COLOR,
-                DRAWING_THICKNESS_1,
-            )
-
-        if v_info["tests"]:
-            test_summary = "  ".join(
-                [
-                    f"V{t['v']}:A{t['area']:.0f}/J{t['J']:.2f}"
-                    for t in v_info["tests"]
-                ]
-            )
-            v_lines.append(test_summary[:MAX_V_SUMMARY_LENGTH])
 
         for line_index, text_line in enumerate(v_lines):
             cv2.putText(
@@ -3933,25 +4025,10 @@ try:
             )
 
         if frame_number % LOG_EVERY_N_FRAMES == 0:
-            console_tests = " | ".join(
-                [
-                    f"V={t['v']} area={t['area']:.0f} J={t['J']:.3f}"
-                    for t in v_info["tests"]
-                ]
-            )
-
             print(
-                "[HSV ADAPT] "
-                f"Brightness={v_info['current_brightness']:.1f} "
-                f"FilteredBrightness={v_info['filtered_brightness']:.1f} "
-                f"VBase={v_info['v_base']} "
-                f"VMin={current_v_min} "
-                f"Area={v_info['area']:.0f} "
-                f"Visual={v_info['visual_score']:.3f} "
-                f"Shape={v_info['shape_score']:.3f} "
-                f"J={v_info['adjustment_score']:.3f} "
-                f"Mode={v_info['mode']} "
-                f"Tests=[{console_tests}]"
+                f"[HSV {'ADAPT' if USE_ADAPTIVE_HSV else 'FIXED'}] "
+                f"H={H_MIN}-{H_MAX} S={S_MIN}-{S_MAX} "
+                f"V={current_v_min}-{V_MAX}"
             )
 
         if tracking_roi is not None:
@@ -4007,6 +4084,27 @@ try:
         exit_requested = (
             cv2.waitKey(KEY_WAIT_MS) & 0xFF == ord(EXIT_KEY)
         )
+        processed_frame_count += 1
+        diagnostics_now = time.perf_counter()
+        diagnostics_elapsed = diagnostics_now - last_diagnostics_time
+        if diagnostics_elapsed >= CAPTURE_DIAGNOSTICS_INTERVAL_SECONDS:
+            capture_count, dropped_count = capture_worker.get_statistics()
+            capture_fps = (
+                capture_count - last_capture_count
+            ) / diagnostics_elapsed
+            processing_fps = (
+                processed_frame_count - last_processed_count
+            ) / diagnostics_elapsed
+            print(
+                f"[PERF] capture={capture_fps:.1f} FPS "
+                f"processing={processing_fps:.1f} FPS "
+                f"latency={frame_latency_ms:.1f} ms "
+                f"dropped={dropped_count}"
+            )
+            last_diagnostics_time = diagnostics_now
+            last_capture_count = capture_count
+            last_processed_count = processed_frame_count
+
         real_loop_seconds = time.perf_counter() - loop_started
         zoom_summary["real_loop_seconds"] += real_loop_seconds
         if zoom_csv_row is not None:
@@ -4021,12 +4119,32 @@ try:
             break
 
 finally:
+    if uart_controller.is_connected and not uart_controller.send("STOP"):
+        print("[UART] STOP nao enviado: conexao com o Arduino perdida.")
+    uart_controller.close()
+    if capture_started:
+        capture_worker.stop()
+        capture_worker.thread.join(timeout=2.0)
+        if capture_worker.thread.is_alive():
+            print(
+                "[WARN] Camera capture thread is still blocked; "
+                "releasing the camera to unblock it."
+            )
+            video.release()
+            camera_released = True
+            capture_worker.thread.join(timeout=2.0)
+        if capture_worker.thread.is_alive():
+            print("[ERROR] Camera capture thread did not stop.")
+    if not camera_released:
+        video.release()
     if zoom_csv_file is not None:
         zoom_csv_file.close()
-    if uart_controller.is_connected:
-        uart_controller.send("STOP")
-    uart_controller.close()
-    video.release()
+    captured_count, dropped_count = capture_worker.get_statistics()
+    print(
+        f"[PERF] captured={captured_count} frames "
+        f"processed={processed_frame_count} "
+        f"dropped={dropped_count}"
+    )
     cv2.destroyAllWindows()
 
 if (
