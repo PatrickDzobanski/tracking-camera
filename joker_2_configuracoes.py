@@ -97,6 +97,15 @@ REFERENCE_IMAGE_PATH =  "img.jpg"
 
 ENABLE_COMPLEMENTARY_ZOOM = True
 ZOOM_FACTORS = (3, 4)
+# The one-way timeout allows 15 s for scanning, 6 s for return, and 1 s margin.
+# Arduino firmware must finish returning before it accepts SEARCHING; Python
+# cannot observe the motor position over this one-way connection.
+VERIFYING_TIMEOUT_SECONDS = 22.0
+VERIFYING_MIN_TRACKING_SECONDS = 2.5
+VERIFYING_CONFIRMATION_INTERVAL_SECONDS = 0.5
+VERIFYING_REQUIRED_DETECTIONS = 3
+VERIFYING_COOLDOWN_SECONDS = 5.0
+SEARCHING_HEARTBEAT_SECONDS = 5.0
 ZOOM_MARGIN = 30
 # Set to True to re-enable benchmark execution and its CSV columns.
 ENABLE_ZOOM_BENCHMARK = False
@@ -420,11 +429,15 @@ class UARTSerialController:
             self.serial_port = None
             return False
 
-    def send_tracking_state(self, tracking_active, error_x, error_y):
-        if tracking_active:
+    def send_tracking_state(self, state, error_x=0, error_y=0):
+        if state == "TRACKING":
             payload = f"TRACKING,{int(error_x)},{int(error_y)}"
-        else:
+        elif state == "VERIFYING":
+            payload = "VERIFYING"
+        elif state == "SEARCHING":
             payload = "SEARCHING,0,0"
+        else:
+            raise ValueError(f"Estado UART invalido: {state}")
         return self.send(payload)
     
     def close(self):
@@ -436,6 +449,115 @@ class UARTSerialController:
                 print(f"[UART] Could not close {self.port}: {exc}")
             finally:
                 self.serial_port = None
+
+
+def resolve_arduino_state(
+    current_state,
+    tracking_active,
+    has_candidate,
+    candidate_center,
+    now,
+    verification_started_at,
+    verification_samples,
+    verification_timeout,
+    cooldown_until,
+    candidate_cleared_after_failure,
+):
+    if verification_started_at is not None:
+        if now - verification_started_at >= verification_timeout:
+            return (
+                "SEARCHING",
+                None,
+                (),
+                now + VERIFYING_COOLDOWN_SECONDS,
+                False,
+                True,
+            )
+
+        samples = list(verification_samples)
+        if has_candidate and candidate_center is not None:
+            should_sample = (
+                not samples
+                or now - samples[-1][0]
+                >= VERIFYING_CONFIRMATION_INTERVAL_SECONDS
+            )
+            if should_sample:
+                center = np.asarray(candidate_center, dtype=np.float32)
+                if (
+                    not samples
+                    or np.linalg.norm(center - samples[-1][1])
+                    <= MAX_CONFIRMATION_DISTANCE_PX
+                ):
+                    samples.append((now, center))
+                else:
+                    samples = [(now, center)]
+
+        verification_elapsed = now - verification_started_at
+        if (
+            tracking_active
+            and has_candidate
+            and verification_elapsed >= VERIFYING_MIN_TRACKING_SECONDS
+            and len(samples) >= VERIFYING_REQUIRED_DETECTIONS
+        ):
+            return "TRACKING", None, (), None, True, False
+
+        return (
+            "VERIFYING",
+            verification_started_at,
+            tuple(samples),
+            cooldown_until,
+            candidate_cleared_after_failure,
+            False,
+        )
+
+    if cooldown_until is not None:
+        if now < cooldown_until:
+            return (
+                "SEARCHING",
+                None,
+                (),
+                cooldown_until,
+                candidate_cleared_after_failure,
+                False,
+            )
+        if not candidate_cleared_after_failure:
+            if not has_candidate:
+                candidate_cleared_after_failure = True
+            return (
+                "SEARCHING",
+                None,
+                (),
+                cooldown_until,
+                candidate_cleared_after_failure,
+                False,
+            )
+        cooldown_until = None
+
+    if has_candidate and current_state != "TRACKING":
+        center = np.asarray(candidate_center, dtype=np.float32)
+        return "VERIFYING", now, ((now, center),), cooldown_until, True, False
+    if tracking_active:
+        return "TRACKING", None, (), cooldown_until, True, False
+    return "SEARCHING", None, (), cooldown_until, True, False
+
+
+def should_send_uart_state(
+    state,
+    last_sent_state,
+    last_searching_sent_at,
+    now,
+):
+    if state == "TRACKING":
+        return True
+    if state == "VERIFYING":
+        return state != last_sent_state
+    if state == "SEARCHING":
+        return (
+            state != last_sent_state
+            or last_searching_sent_at is None
+            or now - last_searching_sent_at >= SEARCHING_HEARTBEAT_SECONDS
+        )
+    raise ValueError(f"Estado UART invalido: {state}")
 
 
 # 2. KALMAN FILTER
@@ -2669,6 +2791,14 @@ processed_frame_count = 0
 capture_worker = LatestFrameCapture(video)
 capture_started = False
 camera_released = False
+arduino_state = "SEARCHING"
+last_uart_state = None
+last_uart_connected = False
+verification_started_at = None
+verification_samples = ()
+verification_cooldown_until = None
+verification_candidate_cleared = True
+last_searching_sent_at = None
 zoom_csv_file = None
 zoom_csv_writer = None
 zoom_csv_path = None
@@ -3329,6 +3459,7 @@ try:
         )
         object_area_px2 = None
         measurement_accepted = None
+        candidate_center = None
         if tracking_candidates:
 
             # Use the visual score before initialization and the combined score afterward.
@@ -3341,6 +3472,7 @@ try:
                 int(round(best["center"][0])),
                 int(round(best["center"][1])),
             )
+            candidate_center = (measured_x, measured_y)
             if "area" in best:
                 object_area_px2 = best["area"]
             else:
@@ -3418,19 +3550,6 @@ try:
                 error_y = 0
                 movement_x = "SEARCHING"
                 movement_y = "SEARCHING"
-
-            if uart_controller.is_connected:
-                uart_controller.send_tracking_state(
-                    tracking_active=tracking_active,
-                    error_x=error_x,
-                    error_y=error_y,
-                )
-            print(
-                f"[TRACKING] state="
-                f"{'TRACKING' if tracking_active else 'SEARCHING'} "
-                f"frames_lost={tracker.missed_frames} "
-                f"error_x={error_x} error_y={error_y}"
-            )
 
             cv2.circle(
                 display_image,
@@ -3559,11 +3678,15 @@ try:
 
             if confirming_target:
                 measurement_status = (
-                    f"CONFIRMING TARGET "
+                    f"VERIFYING TARGET "
                     f"{confirmation_count}/{CONFIRMATIONS_TO_TRACK}"
                 )
             elif not tracking_active:
-                measurement_status = "TRACKING ENDED - SEARCHING"
+                measurement_status = (
+                    "VERIFYING TARGET"
+                    if verification_started_at is not None
+                    else "TRACKING ENDED - SEARCHING"
+                )
             elif measurement_accepted:
                 measurement_status = "MEASUREMENT ACCEPTED"
             else:
@@ -3713,7 +3836,11 @@ try:
 
                     cv2.putText(
                         display_image,
-                        "SEARCHING - TARGET LOST",
+                        (
+                            "VERIFYING TARGET"
+                            if verification_started_at is not None
+                            else "SEARCHING - TARGET LOST"
+                        ),
                         TEXT_POSITION_35,
                         TEXT_FONT,
                         TEXT_SCALE_0_7,
@@ -3728,7 +3855,11 @@ try:
 
                 cv2.putText(
                     display_image,
-                    "SEARCHING",
+                    (
+                        "VERIFYING TARGET"
+                        if verification_started_at is not None
+                        else "SEARCHING"
+                    ),
                     TEXT_POSITION_35,
                     TEXT_FONT,
                     TEXT_SCALE_0_7,
@@ -3736,28 +3867,65 @@ try:
                     TEXT_THICKNESS_2,
                 )
 
-            if uart_controller.is_connected:
-                uart_controller.send_tracking_state(
-                    tracking_active=tracking_active,
-                    error_x=error_x,
-                    error_y=error_y,
-                )
-            print(
-                f"[TRACKING] state="
-                f"{'TRACKING' if tracking_active else 'SEARCHING'} "
-                f"frames_lost={frames_lost} "
-                f"error_x={error_x} error_y={error_y}"
-            )
+        now = time.perf_counter()
+        (
+            arduino_state,
+            verification_started_at,
+            verification_samples,
+            verification_cooldown_until,
+            verification_candidate_cleared,
+            verification_expired,
+        ) = resolve_arduino_state(
+            current_state=arduino_state,
+            tracking_active=tracking_active,
+            has_candidate=bool(tracking_candidates),
+            candidate_center=candidate_center,
+            now=now,
+            verification_started_at=verification_started_at,
+            verification_samples=verification_samples,
+            verification_timeout=VERIFYING_TIMEOUT_SECONDS,
+            cooldown_until=verification_cooldown_until,
+            candidate_cleared_after_failure=verification_candidate_cleared,
+        )
+        if verification_expired:
+            tracker.reset()
 
-        if tracking_candidates:
-            tracking_state = (
-                "TRACKING" if tracking_active else "SEARCHING"
-            )
-        elif tracking_active:
-            tracking_state = "KALMAN"
+        uart_connected = uart_controller.is_connected
+        if uart_connected and not last_uart_connected:
+            last_uart_state = None
+            last_searching_sent_at = None
+        state_changed = arduino_state != last_uart_state
+        should_send_state = should_send_uart_state(
+            arduino_state,
+            last_uart_state,
+            last_searching_sent_at,
+            now,
+        )
+        if uart_connected and should_send_state:
+            if uart_controller.send_tracking_state(
+                state=arduino_state,
+                error_x=error_x,
+                error_y=error_y,
+            ):
+                last_uart_state = arduino_state
+                sent_at = time.perf_counter()
+                if arduino_state == "SEARCHING":
+                    last_searching_sent_at = sent_at
+                elif arduino_state == "VERIFYING" and state_changed:
+                    verification_started_at = sent_at
+                    verification_samples = ()
+        last_uart_connected = uart_controller.is_connected
+
+        print(
+            f"[TRACKING] state={arduino_state} "
+            f"frames_lost={tracker.missed_frames} "
+            f"error_x={error_x} error_y={error_y}"
+        )
+
+        tracking_state = arduino_state
+        if not tracking_candidates and tracking_active:
             chosen_method = "KALMAN"
-        else:
-            tracking_state = "SEARCHING"
+        elif not tracking_candidates and arduino_state == "SEARCHING":
             chosen_method = "SEARCHING"
 
         if object_area_px2 is None:
@@ -3996,11 +4164,7 @@ try:
         v_info_x = max(MIN_DEBUG_X_MARGIN, video_width - DEBUG_PANEL_WIDTH)
         v_info_y = DEBUG_Y_POSITION
 
-        system_state = (
-            "TRACKING"
-            if tracker.initialized
-            else "SEARCHING"
-        )
+        system_state = arduino_state
 
         v_lines = [
             f"STATE: {system_state}",
